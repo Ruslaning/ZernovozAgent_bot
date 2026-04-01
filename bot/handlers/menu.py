@@ -12,6 +12,7 @@ from datetime import datetime
 
 MAIN_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("TOP-20 погрузок", callback_data="top20")],
+    [InlineKeyboardButton("Сколько заявок сейчас", callback_data="count")],
     [InlineKeyboardButton("Анализ цен", callback_data="analysis_menu")],
     [InlineKeyboardButton("Цена хозяйства", callback_data="price_menu")],
     [InlineKeyboardButton("Архив", callback_data="archive_menu")],
