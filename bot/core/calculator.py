@@ -40,8 +40,8 @@ def find_distance_from_archive(address: str) -> dict | None:
         return None
 
     localities = list({r["loading_locality"] for r in rows if r["loading_locality"]})
-    match = process.extractOne(address, localities, scorer=fuzz.token_sort_ratio)
-    if not match or match[1] < 40:
+    match = process.extractOne(address, localities, scorer=fuzz.partial_ratio)
+    if not match or match[1] < 50:
         return None
 
     best_locality = match[0]

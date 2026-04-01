@@ -174,6 +174,10 @@ def archive_applications(apps: list[dict]) -> int:
             now,
         ))
     with get_conn() as conn:
+        # Delete records older than 5 days
+        conn.execute(
+            "DELETE FROM applications_archive WHERE fetched_at < datetime('now', '-5 days')"
+        )
         conn.executemany(
             """INSERT OR IGNORE INTO applications_archive
                (id, created_at, organization_name, rating_value, rating_count,

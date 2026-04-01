@@ -4,9 +4,28 @@ from telegram.ext import ContextTypes
 from bot.core.calculator import calculate_farm_prices
 from bot.data.db import get_port_prices, get_user_settings, set_port_price, set_user_margin, set_user_expenses
 
+# Temporary cache: user_id -> {idx: (locality, culture)}
+_price_cache: dict[int, dict[int, tuple[str, str | None]]] = {}
+
 BACK_BUTTON = InlineKeyboardMarkup([
     [InlineKeyboardButton("Назад", callback_data="back")]
 ])
+
+
+def find_top_localities(address: str, limit: int = 5) -> list:
+    """Find top matching localities from archive."""
+    import sqlite3
+    from rapidfuzz import fuzz, process
+    from bot.data.db import DB_PATH
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT loading_locality FROM applications_archive WHERE loading_locality IS NOT NULL")
+    localities = [r[0] for r in cur.fetchall()]
+    conn.close()
+    if not localities:
+        return []
+    matches = process.extract(address, localities, scorer=fuzz.partial_ratio, limit=limit)
+    return [(m[0], m[1]) for m in matches if m[1] >= 50]
 
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -15,51 +34,79 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not args:
         await update.message.reply_text(
             "Использование:\n"
-            "/price [населённый пункт] - расчёт для всех культур\n"
-            "/price [населённый пункт] [культура] - для конкретной культуры",
+            "/price [населённый пункт]\n"
+            "/price [населённый пункт] [культура]",
             reply_markup=BACK_BUTTON,
         )
         return
 
     user_id = update.effective_user.id
+    known_cultures = {"пшеница", "ячмень", "кукуруза", "подсолнечник", "рапс", "горох", "соя"}
 
-    # Last arg could be a culture name
     culture = None
     location = " ".join(args)
-
-    # Try to detect culture as last argument
-    known_cultures = {"пшеница", "ячмень", "кукуруза", "подсолнечник", "рапс", "горох", "соя"}
     if len(args) >= 2 and args[-1].lower() in known_cultures:
         culture = args[-1].capitalize()
         location = " ".join(args[:-1])
 
-    result = calculate_farm_prices(location, user_id, culture)
-    if not result:
+    # Find top matches
+    matches = find_top_localities(location)
+    if not matches:
         await update.message.reply_text(
-            f"Не удалось найти данные для '{location}'.\n"
-            "Проверьте название или убедитесь, что адрес есть в таблице расстояний.",
+            f"Пункт '{location}' не найден в архиве заявок.",
+            reply_markup=BACK_BUTTON,
+        )
+        return
+
+    # Store matches in cache, use index in callback_data (max 64 bytes)
+    _price_cache[user_id] = {i: (loc, culture) for i, (loc, _) in enumerate(matches)}
+
+    buttons = []
+    for i, (loc, score) in enumerate(matches):
+        short = loc[:35] + "..." if len(loc) > 35 else loc
+        buttons.append([InlineKeyboardButton(
+            f"{short} ({score:.0f}%)",
+            callback_data=f"pl:{user_id}:{i}"  # max ~20 chars
+        )])
+    buttons.append([InlineKeyboardButton("Отмена", callback_data="back")])
+
+    await update.message.reply_text(
+        f"Уточните пункт погрузки для '{location}':",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _show_price_result(update_or_query, address: str, user_id: int, culture: str | None):
+    """Calculate and show farm price result."""
+    from bot.core.calculator import calculate_farm_prices
+
+    result = calculate_farm_prices(address, user_id, culture)
+
+    send = (update_or_query.message.reply_text
+            if hasattr(update_or_query, 'message')
+            else update_or_query.edit_message_text)
+
+    if not result:
+        await send(
+            f"Нет данных для расчёта по '{address}'.\nНедостаточно заявок в архиве.",
             reply_markup=BACK_BUTTON,
         )
         return
 
     days = result.get("analysis_days", 5)
-    lines = [
-        f"Цена хозяйства: {result['address']}",
-        f"Анализ за последние {days} дней\n",
-    ]
+    lines = [f"Цена хозяйства: {result['address']}", f"Анализ за {days} дней\n"]
 
     for p in result["prices"]:
-        source_label = "(архив)" if p["source"] == "archive" else "(Excel)"
+        src = "(архив)" if p["source"] == "archive" else "(Excel)"
         transport_str = (f"{p['transport_min']}–{p['transport_max']}"
-                        if p["transport_min"] != p["transport_max"]
-                        else str(p["transport_avg"]))
+                         if p["transport_min"] != p["transport_max"]
+                         else str(p["transport_avg"]))
         farm_str = (f"{p['farm_min']}–{p['farm_max']}"
-                   if p["farm_min"] != p["farm_max"]
-                   else str(p["farm_avg"]))
-        count_str = f" · {p['data_count']} заявок" if p["data_count"] > 0 else ""
-
+                    if p["farm_min"] != p["farm_max"]
+                    else str(p["farm_avg"]))
+        cnt = f" · {p['data_count']} зая." if p["data_count"] > 0 else ""
         lines.append(
-            f"-> {p['terminal']} ({p['distance_km']} км) {source_label}{count_str}\n"
+            f"-> {p['terminal']} ({p['distance_km']} км) {src}{cnt}\n"
             f"  Порт: {p['port_price']} руб/т\n"
             f"  Перевозка: {transport_str} руб/т\n"
             f"  Цена покупки: {farm_str} руб/т\n"
@@ -68,7 +115,30 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = "\n".join(lines).strip()
     if len(text) > 4096:
         text = text[:4090] + "\n..."
-    await update.message.reply_text(text, reply_markup=BACK_BUTTON)
+    await send(text, reply_markup=BACK_BUTTON)
+
+
+async def price_location_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle pl: callback — user selected a specific locality by index."""
+    query = update.callback_query
+    await query.answer()
+
+    # Format: pl:{user_id}:{index}
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await query.edit_message_text("Ошибка. Попробуйте снова.", reply_markup=BACK_BUTTON)
+        return
+
+    uid = int(parts[1])
+    idx = int(parts[2])
+
+    cache = _price_cache.get(uid, {})
+    if idx not in cache:
+        await query.edit_message_text("Данные устарели. Повторите запрос.", reply_markup=BACK_BUTTON)
+        return
+
+    locality, culture = cache[idx]
+    await _show_price_result(query, locality, uid, culture)
 
 
 async def set_port_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

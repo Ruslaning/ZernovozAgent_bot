@@ -1,10 +1,16 @@
 import httpx
-
+from datetime import datetime, timedelta
 from config import API_URL
 
+ARCHIVE_DAYS = 5  # only fetch applications from last N days
 
-async def fetch_applications() -> list[dict]:
-    """Fetch all applications from zernovozam API, handling pagination."""
+
+async def fetch_applications(days: int = ARCHIVE_DAYS) -> list[dict]:
+    """
+    Fetch applications from zernovozam API.
+    Stops pagination when created_at is older than `days` days.
+    """
+    cutoff = datetime.now() - timedelta(days=days)
     all_apps: list[dict] = []
     page = 1
 
@@ -16,7 +22,22 @@ async def fetch_applications() -> list[dict]:
             apps = body["data"]["applications"]
             if not apps:
                 break
-            all_apps.extend(apps)
+
+            stop = False
+            for app in apps:
+                created = app.get("created_at", "")
+                try:
+                    dt = datetime.strptime(created, "%Y-%m-%d %H:%M:%S")
+                    if dt < cutoff:
+                        stop = True
+                        break
+                except:
+                    pass
+                all_apps.append(app)
+
+            if stop:
+                break
+
             pagination = body["data"].get("pagination")
             if pagination is None or page >= pagination.get("last_page", page):
                 break

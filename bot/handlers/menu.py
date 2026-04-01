@@ -102,21 +102,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(text, reply_markup=BACK_BUTTON)
 
     elif data == "count":
-        await query.edit_message_text("Загружаю данные из API...")
-        try:
-            apps = await fetch_applications()
-        except Exception as exc:
-            await query.edit_message_text(f"Ошибка: {exc}")
-            return
+        import sqlite3
+        from config import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM applications_archive")
+        total = cur.fetchone()[0]
+        cur.execute("""SELECT culture, COUNT(*) as cnt FROM applications_archive
+                       GROUP BY culture ORDER BY cnt DESC LIMIT 5""")
+        top_cultures = cur.fetchall()
+        cur.execute("SELECT MIN(fetched_at), MAX(fetched_at) FROM applications_archive")
+        period = cur.fetchone()
+        conn.close()
 
-        total = len(apps)
-        cultures = {}
-        for a in apps:
-            c = a.get("culture_title", "Прочее")
-            cultures[c] = cultures.get(c, 0) + 1
-
-        top_cultures = sorted(cultures.items(), key=lambda x: x[1], reverse=True)[:5]
-        lines = [f"Заявок в API прямо сейчас: {total}\n", "По культурам (топ-5):"]
+        lines = [f"Заявок в архиве: {total}\n"]
+        if period[0]:
+            from datetime import datetime
+            dt_from = datetime.fromisoformat(period[0]).strftime("%d.%m %H:%M")
+            dt_to = datetime.fromisoformat(period[1]).strftime("%d.%m %H:%M")
+            lines.append(f"Период: {dt_from} — {dt_to}\n")
+        lines.append("По культурам (топ-5):")
         for name, cnt in top_cultures:
             lines.append(f"  {name}: {cnt}")
 
