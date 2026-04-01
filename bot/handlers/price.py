@@ -42,21 +42,27 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    days = result.get("analysis_days", 5)
     lines = [
         f"Цена хозяйства: {result['address']}",
-        f"(совпадение: {result['match_score']:.0f}%)",
-        "",
+        f"Анализ за последние {days} дней\n",
     ]
 
     for p in result["prices"]:
+        source_label = "(архив)" if p["source"] == "archive" else "(Excel)"
+        transport_str = (f"{p['transport_min']}–{p['transport_max']}"
+                        if p["transport_min"] != p["transport_max"]
+                        else str(p["transport_avg"]))
+        farm_str = (f"{p['farm_min']}–{p['farm_max']}"
+                   if p["farm_min"] != p["farm_max"]
+                   else str(p["farm_avg"]))
+        count_str = f" · {p['data_count']} заявок" if p["data_count"] > 0 else ""
+
         lines.append(
-            f"📍 {p['terminal']} ({p['culture']})\n"
-            f"  Портовая цена: {p['port_price']} руб/т\n"
-            f"  Расстояние: {p['distance_km']} км\n"
-            f"  Перевозка: {p['transport_per_ton']} руб/т\n"
-            f"  Маржа: {p['margin']} руб/т\n"
-            f"  Расходы: {p['extra_expenses']} руб/т\n"
-            f"  Цена хозяйства: {p['farm_price']} руб/т\n"
+            f"-> {p['terminal']} ({p['distance_km']} км) {source_label}{count_str}\n"
+            f"  Порт: {p['port_price']} руб/т\n"
+            f"  Перевозка: {transport_str} руб/т\n"
+            f"  Цена покупки: {farm_str} руб/т\n"
         )
 
     text = "\n".join(lines).strip()

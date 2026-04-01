@@ -1,34 +1,26 @@
 from bot.data.db import get_port_prices, get_user_settings, find_distance, DB_PATH
+from bot.core.analyzer import get_price_for_distance, ANALYSIS_DAYS
 from rapidfuzz import fuzz, process
 import sqlite3
 
 
-def get_coefficient(terminal: str, culture: str, distance_km: int) -> float | None:
-    """Get transport coefficient (rub/kg) from loaded Google Sheets data."""
+def get_coefficient_static(terminal: str, culture: str, distance_km: int) -> float | None:
+    """Fallback: get coefficient from static Excel data (transport_coefficients table)."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-
-    # Find nearest distance with tolerance +-20km
     cur.execute("""
-        SELECT coefficient, distance_km
-        FROM transport_coefficients
+        SELECT coefficient FROM transport_coefficients
         WHERE terminal = ? AND culture = ?
-        ORDER BY ABS(distance_km - ?) ASC
-        LIMIT 1
+        ORDER BY ABS(distance_km - ?) ASC LIMIT 1
     """, (terminal, culture, distance_km))
     row = cur.fetchone()
-
-    # If not found by culture, try any culture for this terminal
     if not row:
         cur.execute("""
-            SELECT coefficient, distance_km
-            FROM transport_coefficients
+            SELECT coefficient FROM transport_coefficients
             WHERE terminal = ?
-            ORDER BY ABS(distance_km - ?) ASC
-            LIMIT 1
+            ORDER BY ABS(distance_km - ?) ASC LIMIT 1
         """, (terminal, distance_km))
         row = cur.fetchone()
-
     conn.close()
     return row[0] if row else None
 
@@ -40,8 +32,7 @@ def find_distance_from_archive(address: str) -> dict | None:
     cur = conn.cursor()
     cur.execute("""
         SELECT loading_locality, unloading_terminal, distance
-        FROM applications_archive
-        WHERE distance > 0
+        FROM applications_archive WHERE distance > 0
     """)
     rows = cur.fetchall()
     conn.close()
@@ -54,8 +45,6 @@ def find_distance_from_archive(address: str) -> dict | None:
         return None
 
     best_locality = match[0]
-    score = match[1]
-
     terminal_distances = {}
     for r in rows:
         if r["loading_locality"] == best_locality and r["unloading_terminal"]:
@@ -63,22 +52,13 @@ def find_distance_from_archive(address: str) -> dict | None:
             if t not in terminal_distances:
                 terminal_distances[t] = r["distance"]
 
-    if not terminal_distances:
-        return None
-
-    return {
-        "address": best_locality,
-        "score": score,
-        "distances": terminal_distances,
-        "source": "archive"
-    }
+    return {"address": best_locality, "score": match[1], "distances": terminal_distances, "source": "archive"}
 
 
 def calculate_farm_prices(address: str, user_id: int, culture: str | None = None) -> dict | None:
     """
-    Calculate farm prices for a given address.
-    farm_price = port_price - transport_price_per_ton - margin - extra_expenses
-    transport_price_per_ton = coefficient (rub/kg) * 1000
+    farm_price = port_price - transport_per_ton - margin - extra_expenses
+    Transport price: first try dynamic (from archive last 5 days), then static (Excel).
     """
     dist_data = find_distance(address)
     if not dist_data:
@@ -94,62 +74,73 @@ def calculate_farm_prices(address: str, user_id: int, culture: str | None = None
     if culture:
         port_prices = [p for p in port_prices if p["culture"].lower() == culture.lower()]
 
-    # Get all available terminals from coefficients table
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT terminal FROM transport_coefficients")
-    all_terminals = {r[0] for r in cur.fetchall()}
-    conn.close()
-
     results = []
-    processed_terminals = set()
+    processed = set()
 
     for pp in port_prices:
         terminal = pp["terminal"]
         port_price = pp["price"]
         cult = pp["culture"]
 
-        # Get distance to this terminal
+        key = f"{terminal}_{cult}"
+        if key in processed:
+            continue
+
         dist_km = dist_data["distances"].get(terminal)
-
-        # If not found directly, try Novorossiysk for НЗТ/НКХП/КСК
         if not dist_km and terminal in ("НЗТ", "НКХП", "КСК"):
-            dist_km = dist_data["distances"].get("Новороссийск") or dist_data["distances"].get("НЗТ")
-
+            dist_km = (dist_data["distances"].get("Новороссийск") or
+                       dist_data["distances"].get("НЗТ") or
+                       dist_data["distances"].get("НКХП"))
         if not dist_km or dist_km <= 0:
             continue
 
-        coef = get_coefficient(terminal, cult, int(dist_km))
-        if not coef:
+        # Try dynamic price from archive (last 5 days)
+        price_data = get_price_for_distance(terminal, int(dist_km), cult, ANALYSIS_DAYS)
+        source = "archive"
+
+        # Fallback to static Excel coefficients
+        if not price_data:
+            coef = get_coefficient_static(terminal, cult, int(dist_km))
+            if coef:
+                price_data = {"min": coef, "avg": coef, "max": coef, "count": 0}
+                source = "excel"
+
+        if not price_data:
             continue
 
-        transport_per_ton = round(coef * 1000)
-        farm_price = port_price - transport_per_ton - margin - extra_expenses
+        transport_min = round(price_data["min"] * 1000)
+        transport_avg = round(price_data["avg"] * 1000)
+        transport_max = round(price_data["max"] * 1000)
 
-        key = f"{terminal}_{cult}"
-        if key in processed_terminals:
-            continue
-        processed_terminals.add(key)
+        farm_max = port_price - transport_min - margin - extra_expenses
+        farm_avg = port_price - transport_avg - margin - extra_expenses
+        farm_min = port_price - transport_max - margin - extra_expenses
 
+        processed.add(key)
         results.append({
             "terminal": terminal,
             "culture": cult,
             "port_price": port_price,
             "distance_km": dist_km,
-            "coef_per_kg": coef,
-            "transport_per_ton": transport_per_ton,
+            "transport_min": transport_min,
+            "transport_avg": transport_avg,
+            "transport_max": transport_max,
+            "farm_min": round(farm_min),
+            "farm_avg": round(farm_avg),
+            "farm_max": round(farm_max),
+            "data_count": price_data["count"],
+            "source": source,
             "margin": margin,
             "extra_expenses": extra_expenses,
-            "farm_price": round(farm_price),
         })
 
     if not results:
         return None
 
-    results.sort(key=lambda x: x["farm_price"], reverse=True)
-
+    results.sort(key=lambda x: x["farm_max"], reverse=True)
     return {
         "address": dist_data["address"],
         "match_score": dist_data.get("score", 100),
+        "analysis_days": ANALYSIS_DAYS,
         "prices": results,
     }
