@@ -1,3 +1,5 @@
-python-telegram-bot==21.11
+python-telegram-bot[job-queue]==21.11
 httpx==0.28.1
 gspread==6.1.4
+rapidfuzz==3.12.2
+openpyxl==3.1.5
