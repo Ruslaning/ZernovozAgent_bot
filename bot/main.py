@@ -16,6 +16,7 @@ from bot.handlers.price import (
     set_port_price_command,
     set_margin_command,
     set_expenses_command,
+    set_min_price_command,
     prices_command,
     price_location_callback,
 )
@@ -53,6 +54,7 @@ def main() -> None:
     app.add_handler(CommandHandler("set_port_price", set_port_price_command))
     app.add_handler(CommandHandler("set_margin", set_margin_command))
     app.add_handler(CommandHandler("set_expenses", set_expenses_command))
+    app.add_handler(CommandHandler("set_min_price", set_min_price_command))
     app.add_handler(CommandHandler("prices", prices_command))
     app.add_handler(CallbackQueryHandler(price_location_callback, pattern="^pl:"))
     app.add_handler(CallbackQueryHandler(button_handler))

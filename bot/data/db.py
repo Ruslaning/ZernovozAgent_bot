@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     user_id         INTEGER PRIMARY KEY,
     margin          REAL DEFAULT 250,
     extra_expenses  REAL DEFAULT 225,
+    min_price_30km  REAL DEFAULT 0.55,
     updated_at      TEXT
 );
 
@@ -257,8 +258,23 @@ def get_user_settings(user_id: int) -> dict:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
         if row:
-            return {"margin": row["margin"], "extra_expenses": row["extra_expenses"]}
-        return {"margin": 250.0, "extra_expenses": 225.0}
+            return {
+                "margin": row["margin"],
+                "extra_expenses": row["extra_expenses"],
+                "min_price_30km": row["min_price_30km"] if "min_price_30km" in row.keys() else 0.55,
+            }
+        return {"margin": 250.0, "extra_expenses": 225.0, "min_price_30km": 0.55}
+
+
+def set_min_price(user_id: int, min_price: float) -> None:
+    now = datetime.now().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO user_settings (user_id, margin, extra_expenses, min_price_30km, updated_at)
+               VALUES (?, 250, 225, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET min_price_30km = ?, updated_at = ?""",
+            (user_id, min_price, now, min_price, now),
+        )
 
 
 def set_user_margin(user_id: int, margin: float) -> None:
@@ -290,43 +306,105 @@ def get_all_distances() -> list[sqlite3.Row]:
         return conn.execute("SELECT * FROM distances").fetchall()
 
 
+def _row_to_distance_dict(row) -> dict:
+    """Convert distances DB row to standardized dict."""
+    return {
+        "address": row["full_address"],
+        "score": 100,
+        "distances": {
+            "НЗТ": row["dist_novorossiysk"],
+            "НКХП": row["dist_novorossiysk"],
+            "КСК": row["dist_novorossiysk"],
+            "Тамань": row["dist_taman"],
+            "Азов": row["dist_azov"],
+            "ККЗ": row["dist_kkz"],
+            "Северская": row["dist_severskaya"],
+            "Гулькевичи": row["dist_gulkevichi"],
+            "Гиагинская": row["dist_giaginskaya"],
+            "Темрюк": row["dist_temryuk"],
+            "НПК": row["dist_npk"],
+            "Ровненский": row["dist_rovnenskiy"],
+            "Тбилисская": row["dist_tbilisskaya"],
+            "Кропоткин": row["dist_kropotkin"],
+        },
+    }
+
+
 def find_distance(address: str) -> dict | None:
-    """Find distance record using rapidfuzz fuzzy matching (threshold 80%)."""
-    from rapidfuzz import fuzz
+    """
+    Find distance record with 3-level search:
+    1. Exact match by short address name
+    2. Fuzzy match by short address (ratio >= 75)
+    3. Fuzzy partial match by full_address (fallback)
+    Returns first match or None.
+    """
+    from rapidfuzz import fuzz, process as fz_process
 
     rows = get_all_distances()
     if not rows:
         return None
 
-    best_match = None
-    best_score = 0
-    for row in rows:
-        score = fuzz.ratio(address.lower(), row["full_address"].lower())
-        if score > best_score:
-            best_score = score
-            best_match = row
+    # Level 1: exact match by short address
+    query_lower = address.lower().strip()
+    exact = [r for r in rows if r["address"] and r["address"].lower().strip() == query_lower]
+    if len(exact) == 1:
+        return _row_to_distance_dict(exact[0])
+    if len(exact) > 1:
+        # Multiple matches — return best by full_address
+        return _row_to_distance_dict(exact[0])
 
-    if best_score >= 80 and best_match is not None:
-        terminals = {
-            "НЗТ": best_match["dist_novorossiysk"],
-            "Тамань": best_match["dist_taman"],
-            "Азов": best_match["dist_azov"],
-            "ККЗ": best_match["dist_kkz"],
-            "Северская": best_match["dist_severskaya"],
-            "Гулькевичи": best_match["dist_gulkevichi"],
-            "Гиагинская": best_match["dist_giaginskaya"],
-            "Темрюк": best_match["dist_temryuk"],
-            "НПК": best_match["dist_npk"],
-            "Ровненский": best_match["dist_rovnenskiy"],
-            "Тбилисская": best_match["dist_tbilisskaya"],
-            "Кропоткин": best_match["dist_kropotkin"],
-        }
-        return {
-            "address": best_match["full_address"],
-            "score": best_score,
-            "distances": terminals,
-        }
+    # Level 2: fuzzy by short address (ratio >= 75)
+    addr_map = {i: r["address"] for i, r in enumerate(rows) if r["address"]}
+    match2 = fz_process.extractOne(address, addr_map, scorer=fuzz.ratio, score_cutoff=75)
+    if match2:
+        row = rows[match2[2]]
+        result = _row_to_distance_dict(row)
+        result["score"] = match2[1]
+        return result
+
+    # Level 3: fuzzy partial by full_address (fallback, >= 60)
+    full_map = {i: r["full_address"] for i, r in enumerate(rows) if r["full_address"]}
+    match3 = fz_process.extractOne(address, full_map, scorer=fuzz.partial_ratio, score_cutoff=60)
+    if match3:
+        row = rows[match3[2]]
+        result = _row_to_distance_dict(row)
+        result["score"] = match3[1]
+        return result
+
     return None
+
+
+def find_distance_candidates(address: str, limit: int = 5) -> list[dict]:
+    """
+    Find top N candidates from distances table for disambiguation.
+    Uses short address field first.
+    """
+    from rapidfuzz import fuzz, process as fz_process
+
+    rows = get_all_distances()
+    if not rows:
+        return []
+
+    addr_map = {i: r["address"] for i, r in enumerate(rows) if r["address"]}
+    matches = fz_process.extract(address, addr_map, scorer=fuzz.ratio, limit=limit * 2)
+
+    seen = set()
+    results = []
+    for val, score, idx in matches:
+        if score < 40:
+            continue
+        row = rows[idx]
+        key = row["full_address"]
+        if key in seen:
+            continue
+        seen.add(key)
+        d = _row_to_distance_dict(row)
+        d["score"] = score
+        results.append(d)
+        if len(results) >= limit:
+            break
+
+    return results
 
 
 def get_archive_for_export(days: int = 30) -> list[sqlite3.Row]:

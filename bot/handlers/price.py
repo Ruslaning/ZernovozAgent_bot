@@ -2,7 +2,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from bot.core.calculator import calculate_farm_prices
-from bot.data.db import get_port_prices, get_user_settings, set_port_price, set_user_margin, set_user_expenses
+from bot.data.db import get_port_prices, get_user_settings, set_port_price, set_user_margin, set_user_expenses, set_min_price, find_distance_candidates
 
 # Temporary cache: user_id -> {idx: (locality, culture)}
 _price_cache: dict[int, dict[int, tuple[str, str | None]]] = {}
@@ -13,10 +13,21 @@ BACK_BUTTON = InlineKeyboardMarkup([
 
 
 def find_top_localities(address: str, limit: int = 5) -> list:
-    """Find top matching localities from archive."""
+    """
+    Find top matching localities.
+    Priority: distances table (exact справочник) → archive fallback.
+    Returns list of (display_name, score, source)
+    """
     import sqlite3
     from rapidfuzz import fuzz, process
     from bot.data.db import DB_PATH
+
+    # First: search in distances table
+    candidates = find_distance_candidates(address, limit=limit)
+    if candidates:
+        return [(c["address"], c["score"]) for c in candidates]
+
+    # Fallback: search in archive
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT loading_locality FROM applications_archive WHERE loading_locality IS NOT NULL")
@@ -224,6 +235,25 @@ async def prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines.append(f"  {pp['culture']} → {pp['terminal']}: {pp['price']} руб/т")
 
     await update.message.reply_text("\n".join(lines), reply_markup=BACK_BUTTON)
+
+
+async def set_min_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /set_min_price [value]."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Использование: /set_min_price [значение]\nПример: /set_min_price 0.60",
+            reply_markup=BACK_BUTTON,
+        )
+        return
+    try:
+        val = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Значение должно быть числом.", reply_markup=BACK_BUTTON)
+        return
+    user_id = update.effective_user.id
+    set_min_price(user_id, val)
+    await update.message.reply_text(f"Минималка на 30 км установлена: {val} руб/кг", reply_markup=BACK_BUTTON)
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
